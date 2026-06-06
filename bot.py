@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass, field
 
 import aiohttp
+from aiohttp import web
 import discord
 from discord.ext import commands, tasks
 
@@ -107,6 +109,24 @@ def save_message_ids(message_ids: dict[int, int]) -> None:
     save_state(state)
 
 
+async def start_render_health_server() -> web.AppRunner | None:
+    port_raw = os.getenv("PORT")
+    if not port_raw:
+        return None
+
+    async def health(_request: web.Request) -> web.Response:
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port_raw)).start()
+    log.info("Health server listening on port %s (Render)", port_raw)
+    return runner
+
+
 class LobbyBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -114,14 +134,18 @@ class LobbyBot(commands.Bot):
         self.settings = settings
         self.monitor = MonitorState.from_disk(settings.channel_ids)
         self._http_session: aiohttp.ClientSession | None = None
+        self._health_runner: web.AppRunner | None = None
         self._skipped_channels: set[int] = set()
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
+        self._health_runner = await start_render_health_server()
         self.poll_lobbies.start()
 
     async def close(self) -> None:
         self.poll_lobbies.cancel()
+        if self._health_runner is not None:
+            await self._health_runner.cleanup()
         if self._http_session is not None:
             await self._http_session.close()
         await super().close()
