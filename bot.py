@@ -144,6 +144,10 @@ async def edit_message_with_retry(message: discord.Message, embed: discord.Embed
             raise
 
 
+def embed_fingerprint(embed: discord.Embed) -> str:
+    return json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+
+
 class LobbyBot(commands.Bot):
     def __init__(self, settings: Settings) -> None:
         intents = discord.Intents.default()
@@ -153,6 +157,7 @@ class LobbyBot(commands.Bot):
         self._http_session: aiohttp.ClientSession | None = None
         self._health_runner: web.AppRunner | None = None
         self._skipped_channels: set[int] = set()
+        self._last_embed_fingerprints: dict[int, str] = {}
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
@@ -312,8 +317,13 @@ class LobbyBot(commands.Bot):
         if message is None:
             return
 
+        fingerprint = embed_fingerprint(embed)
+        if self._last_embed_fingerprints.get(channel_id) == fingerprint:
+            return
+
         try:
             await edit_message_with_retry(message, embed)
+            self._last_embed_fingerprints[channel_id] = fingerprint
         except discord.Forbidden:
             log.error("No permission to edit messages in channel %s", channel.id)
         except discord.HTTPException as exc:
