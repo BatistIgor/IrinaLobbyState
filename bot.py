@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -20,6 +21,7 @@ log = logging.getLogger("discord-rv-bot")
 
 STATUS_EMBED_TITLE = "IrInA — монитор лобби"
 HISTORY_SCAN_LIMIT = 100
+RETRYABLE_DISCORD_STATUSES = {429, 502, 503, 504}
 
 
 def progress_bar(occupied: int, total: int) -> str:
@@ -128,6 +130,18 @@ async def start_render_health_server() -> web.AppRunner | None:
     await web.TCPSite(runner, "0.0.0.0", int(port_raw)).start()
     log.info("Health server listening on port %s (Render)", port_raw)
     return runner
+
+
+async def edit_message_with_retry(message: discord.Message, embed: discord.Embed) -> None:
+    for attempt in range(3):
+        try:
+            await message.edit(embed=embed)
+            return
+        except discord.HTTPException as exc:
+            if getattr(exc, "status", None) in RETRYABLE_DISCORD_STATUSES and attempt < 2:
+                await asyncio.sleep(1 + attempt)
+                continue
+            raise
 
 
 class LobbyBot(commands.Bot):
@@ -299,11 +313,11 @@ class LobbyBot(commands.Bot):
             return
 
         try:
-            await message.edit(embed=embed)
+            await edit_message_with_retry(message, embed)
         except discord.Forbidden:
             log.error("No permission to edit messages in channel %s", channel.id)
         except discord.HTTPException as exc:
-            log.error("Failed to edit status message in channel %s: %s", channel.id, exc)
+            log.warning("Failed to edit status message in channel %s: %s", channel.id, exc)
 
     async def update_status_messages(self) -> None:
         lobby, rows, error = await self.fetch_snapshot()
