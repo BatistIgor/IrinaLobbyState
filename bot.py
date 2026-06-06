@@ -18,6 +18,9 @@ from config import STATE_PATH, Settings
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("discord-rv-bot")
 
+STATUS_EMBED_TITLE = "IrInA — монитор лобби"
+HISTORY_SCAN_LIMIT = 100
+
 
 def progress_bar(occupied: int, total: int) -> str:
     total = max(total, 1)
@@ -43,7 +46,7 @@ def build_embed(
     *,
     error: str | None = None,
 ) -> discord.Embed:
-    embed = discord.Embed(title="IrInA — монитор лобби")
+    embed = discord.Embed(title=STATUS_EMBED_TITLE)
 
     if error:
         embed.description = "⚠️ Ошибка при запросе API"
@@ -209,17 +212,61 @@ class LobbyBot(commands.Bot):
             return None
         return fetched if isinstance(fetched, discord.TextChannel) else None
 
+    def _is_status_message(self, message: discord.Message) -> bool:
+        if self.user is None or message.author.id != self.user.id:
+            return False
+        return any(embed.title == STATUS_EMBED_TITLE for embed in message.embeds)
+
+    async def _reconcile_status_messages(
+        self,
+        channel: discord.TextChannel,
+        keep_id: int | None = None,
+    ) -> discord.Message | None:
+        matches: list[discord.Message] = []
+        async for message in channel.history(limit=HISTORY_SCAN_LIMIT):
+            if self._is_status_message(message):
+                matches.append(message)
+
+        if not matches:
+            return None
+
+        keep = matches[0]
+        if keep_id is not None:
+            for message in matches:
+                if message.id == keep_id:
+                    keep = message
+                    break
+
+        for message in matches:
+            if message.id == keep.id:
+                continue
+            try:
+                await message.delete()
+                log.info("Deleted duplicate status message %s in channel %s", message.id, channel.id)
+            except discord.DiscordException as exc:
+                log.warning("Could not delete duplicate message %s: %s", message.id, exc)
+
+        return keep
+
     async def get_or_create_status_message(self, channel: discord.TextChannel) -> discord.Message | None:
         message_id = self.monitor.message_ids.get(channel.id)
         if message_id is not None:
             try:
-                return await channel.fetch_message(message_id)
+                message = await channel.fetch_message(message_id)
+                return await self._reconcile_status_messages(channel, keep_id=message.id) or message
             except discord.NotFound:
-                log.warning("Status message %s not found in channel %s, creating a new one", message_id, channel.id)
+                log.warning("Status message %s not found in channel %s, searching history", message_id, channel.id)
                 self.monitor.message_ids.pop(channel.id, None)
             except discord.Forbidden:
                 log.error("No permission to read messages in channel %s", channel.id)
                 return None
+
+        existing = await self._reconcile_status_messages(channel)
+        if existing is not None:
+            self.monitor.message_ids[channel.id] = existing.id
+            save_message_ids(self.monitor.message_ids)
+            log.info("Reusing existing status message %s in channel %s", existing.id, channel.id)
+            return existing
 
         placeholder = build_embed(None, [])
         try:
