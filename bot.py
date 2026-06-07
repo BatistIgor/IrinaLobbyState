@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 
 import aiohttp
@@ -22,6 +23,7 @@ log = logging.getLogger("discord-rv-bot")
 STATUS_EMBED_TITLE = "IrInA — монитор лобби"
 HISTORY_SCAN_LIMIT = 100
 RETRYABLE_DISCORD_STATUSES = {429, 502, 503, 504}
+MIN_EDIT_INTERVAL_SEC = 5.0
 
 
 def progress_bar(occupied: int, total: int) -> str:
@@ -144,8 +146,22 @@ async def edit_message_with_retry(message: discord.Message, embed: discord.Embed
             raise
 
 
-def embed_fingerprint(embed: discord.Embed) -> str:
-    return json.dumps(embed.to_dict(), sort_keys=True, ensure_ascii=False)
+def snapshot_fingerprint(
+    lobby: api.LobbyState | None,
+    rows: list[api.GameRow],
+    error: str | None,
+) -> str:
+    parts: list[str] = [error or ""]
+    if lobby is None:
+        parts.append("none")
+    else:
+        parts.append(
+            f"{lobby.game_id}:{lobby.occupied}/{lobby.total}:{'|'.join(lobby.players)}"
+        )
+    parts.append(
+        ";".join(f"{row.game_id}:{row.occupied}/{row.total}:{int(row.started)}" for row in rows)
+    )
+    return "\n".join(parts)
 
 
 class LobbyBot(commands.Bot):
@@ -157,7 +173,8 @@ class LobbyBot(commands.Bot):
         self._http_session: aiohttp.ClientSession | None = None
         self._health_runner: web.AppRunner | None = None
         self._skipped_channels: set[int] = set()
-        self._last_embed_fingerprints: dict[int, str] = {}
+        self._last_snapshot_fingerprint: str | None = None
+        self._last_edit_ts: dict[int, float] = {}
 
     async def setup_hook(self) -> None:
         self._http_session = aiohttp.ClientSession()
@@ -271,8 +288,7 @@ class LobbyBot(commands.Bot):
         message_id = self.monitor.message_ids.get(channel.id)
         if message_id is not None:
             try:
-                message = await channel.fetch_message(message_id)
-                return await self._reconcile_status_messages(channel, keep_id=message.id) or message
+                return await channel.fetch_message(message_id)
             except discord.NotFound:
                 log.warning("Status message %s not found in channel %s, searching history", message_id, channel.id)
                 self.monitor.message_ids.pop(channel.id, None)
@@ -313,17 +329,18 @@ class LobbyBot(commands.Bot):
             log.info("Channel %s is available again", channel_id)
             self._skipped_channels.discard(channel_id)
 
+        now = time.monotonic()
+        last_edit = self._last_edit_ts.get(channel_id, 0.0)
+        if now - last_edit < MIN_EDIT_INTERVAL_SEC:
+            return
+
         message = await self.get_or_create_status_message(channel)
         if message is None:
             return
 
-        fingerprint = embed_fingerprint(embed)
-        if self._last_embed_fingerprints.get(channel_id) == fingerprint:
-            return
-
         try:
             await edit_message_with_retry(message, embed)
-            self._last_embed_fingerprints[channel_id] = fingerprint
+            self._last_edit_ts[channel_id] = time.monotonic()
         except discord.Forbidden:
             log.error("No permission to edit messages in channel %s", channel.id)
         except discord.HTTPException as exc:
@@ -331,11 +348,13 @@ class LobbyBot(commands.Bot):
 
     async def update_status_messages(self) -> None:
         lobby, rows, error = await self.fetch_snapshot()
-        events = self.detect_events(lobby, rows)
-        embed = build_embed(lobby, rows, error=error)
-        if events:
-            embed.add_field(name="Последнее событие", value=" | ".join(events), inline=False)
+        self.detect_events(lobby, rows)
+        fingerprint = snapshot_fingerprint(lobby, rows, error)
+        if fingerprint == self._last_snapshot_fingerprint:
+            return
+        self._last_snapshot_fingerprint = fingerprint
 
+        embed = build_embed(lobby, rows, error=error)
         for channel_id in self.settings.channel_ids:
             await self.update_channel(channel_id, embed)
 
